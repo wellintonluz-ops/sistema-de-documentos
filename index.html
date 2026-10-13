@@ -32,6 +32,11 @@
   <!-- Carregamento do SheetJS para leitura de planilhas (.xlsx/.xls/.csv) de cadastro de SKU -->
   <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
+  <!-- Firebase (SDK compat): login Google + banco de dados Firestore -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
   <!-- Estilos CSS embutidos para garantir impressão perfeita em folhas físicas A4 -->
   <style>
     @media print {
@@ -89,6 +94,103 @@
   <!-- Script React compilado localmente em tempo de execução usando Babel -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
+
+    // ===== FIREBASE: configuração, autenticação Google e Firestore =====
+    const firebaseConfig = {
+      apiKey: "AIzaSyBzKINkGuxpJZkRVz5zEK-lTYbpiSg__hI",
+      authDomain: "sistema-de-documentos-6bd4a.firebaseapp.com",
+      projectId: "sistema-de-documentos-6bd4a",
+      storageBucket: "sistema-de-documentos-6bd4a.firebasestorage.app",
+      messagingSenderId: "140795558757",
+      appId: "1:140795558757:web:de9d7e67601a37d60cff8c",
+      measurementId: "G-8N1J083QC8"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+    const db = firebase.firestore();
+    db.settings({ ignoreUndefinedProperties: true });
+
+    // Somente e-mails deste domínio entram no sistema (a regra também é aplicada no Firestore)
+    const DOMINIO_PERMITIDO = "grupotbx.com.br";
+    const COL_DOCUMENTOS = "sadp_documents";
+    const COL_CONFIG = "sadp_config";
+
+    const emailPermitido = (u) => !!(u && u.email && u.emailVerified && u.email.toLowerCase().endsWith("@" + DOMINIO_PERMITIDO));
+
+    const avisarErroFirestore = (err) => {
+      console.error(err);
+      const motivo = err && err.code === 'permission-denied'
+        ? "sem permissão. Confira as regras do Firestore e se você entrou com um e-mail @" + DOMINIO_PERMITIDO + "."
+        : (err && err.message) || "erro desconhecido.";
+      alert("Não foi possível salvar na nuvem: " + motivo);
+    };
+
+    // Dados que existiam no localStorage deste navegador (versão antiga do sistema)
+    const IDS_DE_EXEMPLO = ["F-1024", "I-2011", "AZ-501", "AT-601"];
+    const lerDadosLocais = () => {
+      try {
+        if (localStorage.getItem('sadp_migrado_firestore')) return null;
+        const ler = (chave) => {
+          const bruto = localStorage.getItem(chave);
+          return bruto ? JSON.parse(bruto) : [];
+        };
+        const docs = ler('sadp_documents').filter(d => d && d.id && !IDS_DE_EXEMPLO.includes(d.id));
+        const listas = {
+          skus: ler('sadp_sku_list'),
+          colaboradores: ler('sadp_colaborador_list'),
+          transportadoras: ler('sadp_transportadora_list'),
+          setores: ler('sadp_setor_list')
+        };
+        const total = docs.length + Object.values(listas).reduce((n, l) => n + l.length, 0);
+        return total > 0 ? { docs, listas } : null;
+      } catch (e) {
+        return null;
+      }
+    };
+
+    // Lista de cadastro (SKU, colaboradores...) sincronizada em tempo real com o Firestore.
+    // Edições locais são enviadas com um pequeno atraso para não gravar a cada tecla digitada.
+    function useListaSincronizada(nomeDoc, user) {
+      const [lista, setListaLocal] = useState([]);
+      const pendente = useRef(false);
+      const versao = useRef(0);
+      const timer = useRef(null);
+
+      useEffect(() => {
+        const ref = db.collection(COL_CONFIG).doc(nomeDoc);
+        const cancelar = ref.onSnapshot(
+          (snap) => {
+            if (pendente.current) return;
+            setListaLocal(snap.exists ? (snap.data().itens || []) : []);
+          },
+          (err) => console.error("Erro ao ler " + nomeDoc, err)
+        );
+        return cancelar;
+      }, [nomeDoc]);
+
+      const setLista = (novaLista) => {
+        setListaLocal(novaLista);
+        pendente.current = true;
+        const minhaVersao = ++versao.current;
+        clearTimeout(timer.current);
+        timer.current = setTimeout(() => {
+          const ref = db.collection(COL_CONFIG).doc(nomeDoc);
+          ref.set({
+            itens: novaLista,
+            atualizadoPor: user.email,
+            atualizadoEm: firebase.firestore.FieldValue.serverTimestamp()
+          }).then(() => {
+            if (versao.current === minhaVersao) pendente.current = false;
+          }).catch((err) => {
+            pendente.current = false;
+            avisarErroFirestore(err);
+            ref.get().then(snap => setListaLocal(snap.exists ? (snap.data().itens || []) : []));
+          });
+        }, 600);
+      };
+
+      return [lista, setLista];
+    }
 
     // Ícones em SVG inline de alta resolução
     const Icons = {
@@ -165,92 +267,74 @@
       }
     };
 
-    function App() {
-      // Estado de documentos armazenados no LocalStorage do usuário local
-      const [documents, setDocuments] = useState(() => {
-        const savedDocs = localStorage.getItem('sadp_documents');
-        if (savedDocs) {
-          try {
-            return JSON.parse(savedDocs);
-          } catch (e) {
-            console.error("Erro ao carregar dados salvos do localStorage:", e);
-          }
-        }
-        return [
-          {
-            id: "F-1024",
-            type: "FICHA",
-            sku: "SKU-99021-X",
-            quantidade: "250 Unidades",
-            origem: "DEPÓSITO A1 - CORREDOR 4",
-            setorSolicitante: "Logística e Distribuição",
-            solicitante: "Alessandro Ramos",
-            finalidade: "Abastecimento do estoque de embalagens",
-            dataEntrada: "2026-07-10",
-            permanece: "Dentro do depósito",
-            retiradoPor: "Marcos Vinicius",
-            aprovadoPor: "Roberta Antunes (Liderança)",
-            devolvidoPor: "",
-            recebidoPor: "",
-            status: "entregue",
-            assinadoRetirado: "Marcos Vinicius",
-            assinadoAprovado: "Roberta Antunes",
-            assinadoDevolvido: "",
-            assinadoRecebido: "",
-            dataFinalizacao: "2026-07-11"
-          },
-          {
-            id: "I-2011",
-            type: "IMPORTACAO",
-            sku: "SKU-IMP-77810",
-            descricao: "Motores Elétricos Industriais Trifásicos 5HP",
-            container: "MSCU991208-1",
-            lote: "LOTE-2026-M4",
-            nf: "NF-88421",
-            dataRecebimento: "2026-07-08",
-            recebidoPor: "Fernanda Lima",
-            status: "entregue",
-            nomeRetirada: "Eduardo Rodrigues",
-            documentoRetirada: "RG 4.881.002-X",
-            setorRetirada: "Manutenção Industrial S/A",
-            itemDescricao: "Motores 5HP",
-            dataRetirada: "2026-07-10"
-          },
-          {
-            id: "AZ-501",
-            type: "AVARIA_ZEUS",
-            sku: "SKU-TUB-9011-Y",
-            quantidade: "2 Unidades",
-            valor: "1.450,00",
-            operacao: "descarregamento",
-            nomeAvaria: "Mateus Pinheiro Martins",
-            documento: "RG 5.334.120-0",
-            dataOcorrencia: "2026-07-13",
-            status: "entregue",
-          },
-          {
-            id: "AT-601",
-            type: "AVARIA_TRANSP",
-            sku: "SKU-TRA-88540",
-            quantidade: "12 Bobinas",
-            valor: "4.850,00",
-            nf: "NF-99841",
-            operacao: "descarregamento",
-            nomeAvaria: "Rodrigo Faustino",
-            documentoAvaria: "RG 3.441.902",
-            nomeMotorista: "Carlos André Antunes",
-            documentoMotorista: "RG 2.884.112-0",
-            placaVeiculo: "MXX-4B12",
-            transportadora: "TransRapid Joinville Ltda",
-            dataOcorrencia: "2026-07-12",
-            status: "entregue"
-          }
-        ];
-      });
+    function App({ user }) {
+      // Documentos sincronizados em tempo real com o Firestore (compartilhados por todos os usuários)
+      const [documents, setDocuments] = useState([]);
+      const [carregandoDocs, setCarregandoDocs] = useState(true);
+      const [erroNuvem, setErroNuvem] = useState("");
 
       useEffect(() => {
-        localStorage.setItem('sadp_documents', JSON.stringify(documents));
-      }, [documents]);
+        const cancelar = db.collection(COL_DOCUMENTOS).onSnapshot(
+          (snap) => {
+            const lista = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+            lista.sort((a, b) =>
+              (b.criadoEm || '').localeCompare(a.criadoEm || '') ||
+              b.id.localeCompare(a.id, undefined, { numeric: true })
+            );
+            setDocuments(lista);
+            setCarregandoDocs(false);
+            setErroNuvem("");
+          },
+          (err) => {
+            console.error("Erro ao ler documentos:", err);
+            setCarregandoDocs(false);
+            setErroNuvem(err.code === 'permission-denied'
+              ? "Sem permissão para acessar os dados na nuvem. Confira as regras do Firestore e entre com um e-mail @" + DOMINIO_PERMITIDO + "."
+              : "Falha de conexão com a nuvem. Verifique sua internet e recarregue a página.");
+          }
+        );
+        return cancelar;
+      }, []);
+
+      // Migração única dos dados que estavam no localStorage deste navegador
+      const [dadosLocais, setDadosLocais] = useState(() => lerDadosLocais());
+      const [migrando, setMigrando] = useState(false);
+
+      const migrarDadosLocais = async () => {
+        if (!dadosLocais) return;
+        setMigrando(true);
+        try {
+          const existentes = new Set(documents.map(d => d.id));
+          const novos = dadosLocais.docs.filter(d => !existentes.has(d.id));
+          const ignorados = dadosLocais.docs.length - novos.length;
+          for (let i = 0; i < novos.length; i += 400) {
+            const lote = db.batch();
+            novos.slice(i, i + 400).forEach(d => {
+              lote.set(db.collection(COL_DOCUMENTOS).doc(d.id), { ...d, migradoPor: user.email });
+            });
+            await lote.commit();
+          }
+          for (const [nomeDoc, itensLocais] of Object.entries(dadosLocais.listas)) {
+            if (!itensLocais.length) continue;
+            const ref = db.collection(COL_CONFIG).doc(nomeDoc);
+            const snap = await ref.get();
+            const atuais = snap.exists ? (snap.data().itens || []) : [];
+            const uniao = Array.from(new Set([...atuais, ...itensLocais])).sort();
+            await ref.set({
+              itens: uniao,
+              atualizadoPor: user.email,
+              atualizadoEm: firebase.firestore.FieldValue.serverTimestamp()
+            });
+          }
+          localStorage.setItem('sadp_migrado_firestore', new Date().toISOString());
+          setDadosLocais(null);
+          alert(novos.length + " documento(s) e os cadastros foram enviados para a nuvem." +
+            (ignorados > 0 ? " " + ignorados + " documento(s) foram ignorados porque já existe um registro com o mesmo ID na nuvem." : ""));
+        } catch (err) {
+          avisarErroFirestore(err);
+        }
+        setMigrando(false);
+      };
 
       // Assinaturas digitais não ficam mais num banco separado: cada uma é salva
       // como campo do próprio documento e some junto quando o documento é excluído.
@@ -260,14 +344,7 @@
       }, []);
 
       // Cadastro de SKUs usado para pré-seleção nas telas de ADM.AT e Avarias
-      const [skuList, setSkuList] = useState(() => {
-        const saved = localStorage.getItem('sadp_sku_list');
-        return saved ? JSON.parse(saved) : [];
-      });
-
-      useEffect(() => {
-        localStorage.setItem('sadp_sku_list', JSON.stringify(skuList));
-      }, [skuList]);
+      const [skuList, setSkuList] = useListaSincronizada('skus', user);
 
       const [cadastroView, setCadastroView] = useState('atual');
       const [novoSkuManual, setNovoSkuManual] = useState('');
@@ -331,14 +408,7 @@
       };
 
       // Cadastro de Colaboradores usado para pré-seleção nas telas de ADM.AT e Arquivo de Importação
-      const [colaboradorList, setColaboradorList] = useState(() => {
-        const saved = localStorage.getItem('sadp_colaborador_list');
-        return saved ? JSON.parse(saved) : [];
-      });
-
-      useEffect(() => {
-        localStorage.setItem('sadp_colaborador_list', JSON.stringify(colaboradorList));
-      }, [colaboradorList]);
+      const [colaboradorList, setColaboradorList] = useListaSincronizada('colaboradores', user);
 
       const [cadastroColabView, setCadastroColabView] = useState('atual');
       const [novoColaboradorManual, setNovoColaboradorManual] = useState('');
@@ -399,14 +469,7 @@
       };
 
       // Cadastro de Transportadoras usado para pré-seleção no documento de Avaria de Transportadora
-      const [transportadoraList, setTransportadoraList] = useState(() => {
-        const saved = localStorage.getItem('sadp_transportadora_list');
-        return saved ? JSON.parse(saved) : [];
-      });
-
-      useEffect(() => {
-        localStorage.setItem('sadp_transportadora_list', JSON.stringify(transportadoraList));
-      }, [transportadoraList]);
+      const [transportadoraList, setTransportadoraList] = useListaSincronizada('transportadoras', user);
 
       const [cadastroTranspView, setCadastroTranspView] = useState('atual');
       const [novaTransportadoraManual, setNovaTransportadoraManual] = useState('');
@@ -467,14 +530,7 @@
       };
 
       // Cadastro de Setores usado para pré-seleção no ADM.AT e no Arquivo de Importação
-      const [setorList, setSetorList] = useState(() => {
-        const saved = localStorage.getItem('sadp_setor_list');
-        return saved ? JSON.parse(saved) : [];
-      });
-
-      useEffect(() => {
-        localStorage.setItem('sadp_setor_list', JSON.stringify(setorList));
-      }, [setorList]);
+      const [setorList, setSetorList] = useListaSincronizada('setores', user);
 
       const [cadastroSetorView, setCadastroSetorView] = useState('atual');
       const [novoSetorManual, setNovoSetorManual] = useState('');
@@ -637,6 +693,12 @@
       const [localizacaoInput, setLocalizacaoInput] = useState("");
       const [localizacaoResponsavelInput, setLocalizacaoResponsavelInput] = useState("");
 
+      const [obsInput, setObsInput] = useState("");
+      const obsTimer = useRef(null);
+      useEffect(() => {
+        setObsInput(selectedDoc?.observacaoInterna || "");
+      }, [selectedDocId]);
+
       useEffect(() => {
         if (selectedDoc && selectedDoc.type === 'IMPORTACAO') {
           setLocalizacaoInput(selectedDoc.localizacaoArmazenamento || "");
@@ -644,9 +706,10 @@
         }
       }, [selectedDocId]);
 
-      const getNextSequentialId = (prefix, type) => {
+      // IDs sequenciais gerados por um contador no Firestore (transação), evitando IDs repetidos entre usuários
+      const getNextSequentialId = async (prefix, type) => {
         const regex = new RegExp(`^${prefix}-(\\d+)$`);
-        const maxNum = documents
+        const maiorLocal = documents
           .filter(d => d.type === type)
           .reduce((max, d) => {
             const match = d.id.match(regex);
@@ -654,12 +717,56 @@
             const num = parseInt(match[1], 10);
             return num > max ? num : max;
           }, 0);
-        return `${prefix}-${String(maxNum + 1).padStart(4, '0')}`;
+        const refContadores = db.collection(COL_CONFIG).doc('contadores');
+        return db.runTransaction(async (tx) => {
+          const snap = await tx.get(refContadores);
+          const atual = snap.exists ? (snap.data()[prefix] || 0) : 0;
+          const proximo = Math.max(atual, maiorLocal) + 1;
+          tx.set(refContadores, { [prefix]: proximo }, { merge: true });
+          return `${prefix}-${String(proximo).padStart(4, '0')}`;
+        });
       };
 
-      const handleGerarFicha = (e) => {
+      // Grava um documento novo (aparece na tela na hora e é confirmado pela nuvem)
+      const salvarDocumento = async (novoDoc) => {
+        const completo = { ...novoDoc, criadoPor: user.email, criadoEm: new Date().toISOString() };
+        setDocuments(prev => [completo, ...prev.filter(d => d.id !== completo.id)]);
+        try {
+          await db.collection(COL_DOCUMENTOS).doc(completo.id).set(completo);
+        } catch (err) {
+          setDocuments(prev => prev.filter(d => d.id !== completo.id));
+          throw err;
+        }
+      };
+
+      // Atualiza campos de um documento existente
+      const atualizarDocumento = (id, campos) => {
+        setDocuments(prev => prev.map(d => d.id === id ? { ...d, ...campos } : d));
+        return db.collection(COL_DOCUMENTOS).doc(id).set(campos, { merge: true }).catch(avisarErroFirestore);
+      };
+
+      // Impede envio duplicado do mesmo formulário (duplo clique enquanto salva)
+      const salvandoRef = useRef(false);
+      const comTrava = (fn) => async (e) => {
+        if (e && e.preventDefault) e.preventDefault();
+        if (salvandoRef.current) return;
+        salvandoRef.current = true;
+        try {
+          await fn(e);
+        } finally {
+          salvandoRef.current = false;
+        }
+      };
+
+      const handleGerarFicha = async (e) => {
         e.preventDefault();
-        const newId = getNextSequentialId('ADM', 'FICHA');
+        let newId;
+        try {
+          newId = await getNextSequentialId('ADM', 'FICHA');
+        } catch (err) {
+          avisarErroFirestore(err);
+          return;
+        }
         const nomeRetirada = toTitleCase(fichaForm.retiradoPor);
         const nomeAprovado = toTitleCase(fichaForm.aprovadoPor);
         const newDoc = {
@@ -689,7 +796,12 @@
           dataHoraRecebido: "",
           observacaoInterna: ""
         };
-        setDocuments([newDoc, ...documents]);
+        try {
+          await salvarDocumento(newDoc);
+        } catch (err) {
+          avisarErroFirestore(err);
+          return;
+        }
         setFichaForm({
           sku: "",
           quantidade: "",
@@ -714,9 +826,15 @@
         handleOpenDigitalSign(fila[0].role, fila[0].nome);
       };
 
-      const handleGerarImport = (e) => {
+      const handleGerarImport = async (e) => {
         e.preventDefault();
-        const newId = getNextSequentialId('IMP', 'IMPORTACAO');
+        let newId;
+        try {
+          newId = await getNextSequentialId('IMP', 'IMPORTACAO');
+        } catch (err) {
+          avisarErroFirestore(err);
+          return;
+        }
         const newDoc = {
           id: newId,
           type: "IMPORTACAO",
@@ -745,7 +863,12 @@
             dataHora: new Date().toISOString()
           }]
         };
-        setDocuments([newDoc, ...documents]);
+        try {
+          await salvarDocumento(newDoc);
+        } catch (err) {
+          avisarErroFirestore(err);
+          return;
+        }
         setImportForm({
           sku: "",
           descricao: "",
@@ -760,9 +883,15 @@
         setSelectedDocId(newId);
       };
 
-      const handleGerarAvariaZeus = (e) => {
+      const handleGerarAvariaZeus = async (e) => {
         e.preventDefault();
-        const newId = `AZ-${Math.floor(100 + Math.random() * 900)}`;
+        let newId;
+        try {
+          newId = await getNextSequentialId('AZ', 'AVARIA_ZEUS');
+        } catch (err) {
+          avisarErroFirestore(err);
+          return;
+        }
         const newDoc = {
           id: newId,
           type: "AVARIA_ZEUS",
@@ -778,7 +907,12 @@
           registradoPor: toTitleCase(avariaZeusForm.registradoPor),
           descricaoAvaria: avariaZeusForm.descricaoAvaria
         };
-        setDocuments([newDoc, ...documents]);
+        try {
+          await salvarDocumento(newDoc);
+        } catch (err) {
+          avisarErroFirestore(err);
+          return;
+        }
         setAvariaZeusForm({
           sku: "",
           quantidade: "",
@@ -794,9 +928,15 @@
         setSelectedDocId(newId);
       };
 
-      const handleGerarAvariaTransp = (e) => {
+      const handleGerarAvariaTransp = async (e) => {
         e.preventDefault();
-        const newId = `AT-${Math.floor(100 + Math.random() * 900)}`;
+        let newId;
+        try {
+          newId = await getNextSequentialId('AT', 'AVARIA_TRANSP');
+        } catch (err) {
+          avisarErroFirestore(err);
+          return;
+        }
         const newDoc = {
           id: newId,
           type: "AVARIA_TRANSP",
@@ -817,7 +957,12 @@
           registradoPor: toTitleCase(avariaTranspForm.registradoPor),
           descricaoAvaria: avariaTranspForm.descricaoAvaria
         };
-        setDocuments([newDoc, ...documents]);
+        try {
+          await salvarDocumento(newDoc);
+        } catch (err) {
+          avisarErroFirestore(err);
+          return;
+        }
         setAvariaTranspForm({
           sku: "",
           quantidade: "",
@@ -955,7 +1100,7 @@
         };
 
         const campo = digitalSignFieldPorFuncao[digitalSignRole];
-        setDocuments(prev => prev.map(doc => doc.id === selectedDocId ? { ...doc, [campo]: signaturePayload } : doc));
+        atualizarDocumento(selectedDocId, { [campo]: signaturePayload });
 
         if (isMandatorySign && mandatorySignQueue.length > 0) {
           const [proximo, ...resto] = mandatorySignQueue;
@@ -998,26 +1143,22 @@
       const submitFichaSign = (e) => {
         e.preventDefault();
         const agora = new Date().toISOString();
-        setDocuments(prev => prev.map(doc => {
-          if (doc.id === selectedDocId) {
-            return {
-              ...doc,
-              status: 'entregue',
-              assinadoRetirado: toTitleCase(fichaSignForm.confirmadoRetirado),
-              assinadoAprovado: toTitleCase(fichaSignForm.confirmadoAprovado),
-              devolvidoPor: toTitleCase(fichaSignForm.confirmadoDevolvido),
-              recebidoPor: toTitleCase(fichaSignForm.confirmadoRecebido),
-              assinadoDevolvido: toTitleCase(fichaSignForm.confirmadoDevolvido),
-              assinadoRecebido: toTitleCase(fichaSignForm.confirmadoRecebido),
-              dataFinalizacao: getLocalDateString(),
-              dataHoraRetirada: fichaSignForm.confirmadoRetirado ? agora : doc.dataHoraRetirada,
-              dataHoraAprovado: fichaSignForm.confirmadoAprovado ? agora : doc.dataHoraAprovado,
-              dataHoraDevolvido: fichaSignForm.confirmadoDevolvido ? agora : doc.dataHoraDevolvido,
-              dataHoraRecebido: fichaSignForm.confirmadoRecebido ? agora : doc.dataHoraRecebido
-            };
-          }
-          return doc;
-        }));
+        const docAtual = documents.find(d => d.id === selectedDocId);
+        if (!docAtual) return;
+        atualizarDocumento(selectedDocId, {
+          status: 'entregue',
+          assinadoRetirado: toTitleCase(fichaSignForm.confirmadoRetirado),
+          assinadoAprovado: toTitleCase(fichaSignForm.confirmadoAprovado),
+          devolvidoPor: toTitleCase(fichaSignForm.confirmadoDevolvido),
+          recebidoPor: toTitleCase(fichaSignForm.confirmadoRecebido),
+          assinadoDevolvido: toTitleCase(fichaSignForm.confirmadoDevolvido),
+          assinadoRecebido: toTitleCase(fichaSignForm.confirmadoRecebido),
+          dataFinalizacao: getLocalDateString(),
+          dataHoraRetirada: fichaSignForm.confirmadoRetirado ? agora : (docAtual.dataHoraRetirada || ""),
+          dataHoraAprovado: fichaSignForm.confirmadoAprovado ? agora : (docAtual.dataHoraAprovado || ""),
+          dataHoraDevolvido: fichaSignForm.confirmadoDevolvido ? agora : (docAtual.dataHoraDevolvido || ""),
+          dataHoraRecebido: fichaSignForm.confirmadoRecebido ? agora : (docAtual.dataHoraRecebido || "")
+        });
         setIsFichaSignModalOpen(false);
         setActiveMenu('ficha-entregue');
       };
@@ -1026,23 +1167,17 @@
         e.preventDefault();
         const nomeEntrega = toTitleCase(importRetiradaForm.responsavelEntrega);
         const nomeRetirante = toTitleCase(importRetiradaForm.nomeRetirada);
-        setDocuments(prev => prev.map(doc => {
-          if (doc.id === selectedDocId) {
-            return {
-              ...doc,
-              status: 'entregue',
-              responsavelEntrega: nomeEntrega,
-              nomeRetirada: nomeRetirante,
-              documentoRetirada: toUpperCase(importRetiradaForm.documentoRetirada),
-              setorRetirada: toTitleCase(importRetiradaForm.setorRetirada),
-              itemDescricao: toTitleCase(importRetiradaForm.itemDescricao),
-              dataRetirada: importRetiradaForm.dataRetirada,
-              emailRetirada: importRetiradaForm.emailRetirada.trim().toLowerCase(),
-              dataHoraConfirmacaoRetirada: new Date().toISOString()
-            };
-          }
-          return doc;
-        }));
+        atualizarDocumento(selectedDocId, {
+          status: 'entregue',
+          responsavelEntrega: nomeEntrega,
+          nomeRetirada: nomeRetirante,
+          documentoRetirada: toUpperCase(importRetiradaForm.documentoRetirada),
+          setorRetirada: toTitleCase(importRetiradaForm.setorRetirada),
+          itemDescricao: toTitleCase(importRetiradaForm.itemDescricao),
+          dataRetirada: importRetiradaForm.dataRetirada,
+          emailRetirada: importRetiradaForm.emailRetirada.trim().toLowerCase(),
+          dataHoraConfirmacaoRetirada: new Date().toISOString()
+        });
         setIsImportRetiradaModalOpen(false);
         setActiveMenu('import-entregue');
 
@@ -1056,25 +1191,28 @@
       };
 
       const handleUpdateObservacao = (id, texto) => {
-        setDocuments(prev => prev.map(doc => doc.id === id ? { ...doc, observacaoInterna: texto } : doc));
+        setObsInput(texto);
+        clearTimeout(obsTimer.current);
+        obsTimer.current = setTimeout(() => {
+          db.collection(COL_DOCUMENTOS).doc(id).set({ observacaoInterna: texto }, { merge: true }).catch(avisarErroFirestore);
+        }, 700);
       };
 
       const handleUpdateLocalizacao = (id, novaLocalizacao, responsavelMovimentacao) => {
         const valor = toTitleCase(novaLocalizacao.trim());
         const responsavel = (responsavelMovimentacao || "").trim();
         if (!valor || !responsavel) return;
-        setDocuments(prev => prev.map(doc => {
-          if (doc.id !== id) return doc;
-          const anterior = doc.localizacaoArmazenamento || "";
-          if (anterior === valor) return doc;
-          const historico = [...(doc.localizacaoHistorico || []), {
-            de: anterior,
-            para: valor,
-            responsavel: responsavel,
-            dataHora: new Date().toISOString()
-          }];
-          return { ...doc, localizacaoArmazenamento: valor, localizacaoHistorico: historico };
-        }));
+        const docAtual = documents.find(d => d.id === id);
+        if (!docAtual) return;
+        const anterior = docAtual.localizacaoArmazenamento || "";
+        if (anterior === valor) return;
+        const historico = [...(docAtual.localizacaoHistorico || []), {
+          de: anterior,
+          para: valor,
+          responsavel: responsavel,
+          dataHora: new Date().toISOString()
+        }];
+        atualizarDocumento(id, { localizacaoArmazenamento: valor, localizacaoHistorico: historico });
       };
 
       const handleDelete = (id) => {
@@ -1085,11 +1223,13 @@
 
       const executeDelete = () => {
         const idToDelete = deleteConfirmId;
-        setDocuments(prev => {
-          const target = prev.find(d => d.id === idToDelete);
-          if (target && target.type === 'IMPORTACAO') return prev;
-          return prev.filter(d => d.id !== idToDelete);
-        });
+        const target = documents.find(d => d.id === idToDelete);
+        if (target && target.type === 'IMPORTACAO') {
+          setDeleteConfirmId(null);
+          return;
+        }
+        db.collection(COL_DOCUMENTOS).doc(idToDelete).delete().catch(avisarErroFirestore);
+        setDocuments(prev => prev.filter(d => d.id !== idToDelete));
         setDeleteConfirmId(null);
         setSelectedDocId(null);
       };
@@ -1171,8 +1311,46 @@
               <span className="text-xs sm:text-sm bg-slate-800 text-slate-300 px-3 py-1 rounded-full font-mono border border-slate-700">
                 index.com / ADM.AT & Logística
               </span>
+              <div className="hidden sm:flex items-center space-x-2 text-xs text-slate-300">
+                {user.photoURL && <img src={user.photoURL} alt="" referrerPolicy="no-referrer" className="w-7 h-7 rounded-full border border-slate-600" />}
+                <span className="max-w-[180px] truncate" title={user.email}>{user.displayName || user.email}</span>
+              </div>
+              <button
+                onClick={() => auth.signOut()}
+                className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 font-semibold"
+              >
+                Sair
+              </button>
             </div>
           </header>
+
+          {erroNuvem && (
+            <div className="bg-red-600 text-white text-xs px-6 py-2 print:hidden">{erroNuvem}</div>
+          )}
+
+          {dadosLocais && (
+            <div className="bg-amber-100 border-b border-amber-300 text-amber-900 text-xs px-6 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 print:hidden">
+              <span>
+                <strong>Dados antigos neste navegador:</strong> há {dadosLocais.docs.length} documento(s) e cadastros salvos localmente.
+                Envie para a nuvem para que todos os usuários possam vê-los.
+              </span>
+              <div className="flex gap-2">
+                <button
+                  onClick={migrarDadosLocais}
+                  disabled={migrando || carregandoDocs}
+                  className="bg-amber-600 hover:bg-amber-700 disabled:bg-slate-300 text-white font-bold px-3 py-1.5 rounded-lg"
+                >
+                  {migrando ? 'Enviando...' : 'Enviar para a nuvem'}
+                </button>
+                <button
+                  onClick={() => { localStorage.setItem('sadp_migrado_firestore', 'dispensado'); setDadosLocais(null); }}
+                  className="bg-white hover:bg-amber-50 border border-amber-300 text-amber-800 font-bold px-3 py-1.5 rounded-lg"
+                >
+                  Dispensar
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Layout Base */}
           <div className="flex flex-1 relative print:block">
@@ -1653,7 +1831,7 @@
                         <p className="text-xs text-indigo-200 mt-1">Gere novos documentos para controle de fluxo de cargas.</p>
                       </div>
                       
-                      <form onSubmit={handleGerarFicha} className="p-6 space-y-6">
+                      <form onSubmit={comTrava(handleGerarFicha)} className="p-6 space-y-6">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                           <div>
                             <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Código (SKU) *</label>
@@ -1744,7 +1922,7 @@
                         <h3 className="text-lg font-bold">Importação - Registro de Chegada de Material</h3>
                       </div>
                       
-                      <form onSubmit={handleGerarImport} className="p-6 space-y-6">
+                      <form onSubmit={comTrava(handleGerarImport)} className="p-6 space-y-6">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                           <div>
                             <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Código (SKU) *</label>
@@ -1809,7 +1987,7 @@
                         <p className="text-xs text-red-100 mt-1">Preencha os campos para salvar, arquivar e imprimir o documento oficial Tubrax.</p>
                       </div>
                       
-                      <form onSubmit={handleGerarAvariaZeus} className="p-6 space-y-6">
+                      <form onSubmit={comTrava(handleGerarAvariaZeus)} className="p-6 space-y-6">
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                           <div>
                             <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Código (SKU) *</label>
@@ -1890,7 +2068,7 @@
                         <p className="text-xs text-amber-100 mt-1">Preencha os campos abaixo de acordo com o modelo de resguardo de mercadorias externas.</p>
                       </div>
                       
-                      <form onSubmit={handleGerarAvariaTransp} className="p-6 space-y-6">
+                      <form onSubmit={comTrava(handleGerarAvariaTransp)} className="p-6 space-y-6">
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                           <div>
                             <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Código (SKU) *</label>
@@ -2543,7 +2721,7 @@
                               Anotação Interna (visível somente na plataforma, não altera nem aparece no documento impresso)
                             </label>
                             <textarea
-                              value={selectedDoc.observacaoInterna || ""}
+                              value={obsInput}
                               onChange={e => handleUpdateObservacao(selectedDoc.id, e.target.value)}
                               placeholder="Adicione um comentário ou marcador interno sobre este registro..."
                               rows={2}
@@ -3400,10 +3578,116 @@
       );
     }
 
+    // Porta de entrada: só renderiza o sistema para usuários Google com e-mail do domínio permitido
+    function AuthGate() {
+      const [user, setUser] = useState(null);
+      const [verificando, setVerificando] = useState(true);
+      const [entrando, setEntrando] = useState(false);
+      const [erro, setErro] = useState("");
+
+      useEffect(() => {
+        const cancelar = auth.onAuthStateChanged(async (u) => {
+          if (!u) {
+            setUser(null);
+            setVerificando(false);
+            return;
+          }
+          if (emailPermitido(u)) {
+            setErro("");
+            setUser(u);
+          } else {
+            setUser(null);
+            setErro("A conta " + u.email + " não tem acesso. Entre com um e-mail @" + DOMINIO_PERMITIDO + ".");
+            await auth.signOut();
+          }
+          setVerificando(false);
+        });
+        return cancelar;
+      }, []);
+
+      const entrar = async () => {
+        setErro("");
+        setEntrando(true);
+        try {
+          const provider = new firebase.auth.GoogleAuthProvider();
+          provider.setCustomParameters({ hd: DOMINIO_PERMITIDO, prompt: 'select_account' });
+          await auth.signInWithPopup(provider);
+        } catch (err) {
+          console.error(err);
+          if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
+            // usuário fechou a janela: nada a mostrar
+          } else if (err.code === 'auth/popup-blocked') {
+            setErro("O navegador bloqueou a janela de login. Libere os pop-ups para este site e tente de novo.");
+          } else if (err.code === 'auth/unauthorized-domain') {
+            setErro("Este endereço não está autorizado no Firebase (Authentication > Configurações > Domínios autorizados).");
+          } else if (err.code === 'auth/operation-not-supported-in-this-environment') {
+            setErro("Abra o sistema por um endereço http(s) (por exemplo, o do GitHub Pages), não direto do arquivo no computador.");
+          } else {
+            setErro(err.message || "Não foi possível entrar. Tente novamente.");
+          }
+        }
+        setEntrando(false);
+      };
+
+      if (verificando) {
+        return (
+          <div className="min-h-screen bg-slate-900 flex items-center justify-center text-slate-300 text-sm">
+            Verificando acesso...
+          </div>
+        );
+      }
+
+      if (!user) {
+        return (
+          <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+            <div className="w-full max-w-sm bg-white rounded-2xl shadow-2xl overflow-hidden">
+              <div className="bg-slate-950 text-white px-6 py-7 text-center">
+                <div className="flex items-center justify-center gap-3 mb-3">
+                  <span className="font-sans text-sm tracking-[0.25em] text-slate-400 uppercase">Grupo</span>
+                  <span className="w-[3px] h-6 bg-red-600 inline-block"></span>
+                  <span className="font-sans text-2xl font-black tracking-tight">TBX</span>
+                </div>
+                <h1 className="text-lg font-bold">Portal SADP</h1>
+                <p className="text-xs text-slate-400 mt-1">Sistema de Armazenamento de Documentos Padrão</p>
+              </div>
+              <div className="p-6 space-y-4">
+                <p className="text-sm text-slate-600 text-center">
+                  Acesso restrito a colaboradores com e-mail <strong>@{DOMINIO_PERMITIDO}</strong>.
+                </p>
+                {erro && (
+                  <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg p-3 leading-relaxed">{erro}</div>
+                )}
+                {window.location.protocol === 'file:' && (
+                  <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs rounded-lg p-3 leading-relaxed">
+                    O login com Google não funciona abrindo o arquivo direto do computador. Acesse pelo endereço publicado (GitHub Pages).
+                  </div>
+                )}
+                <button
+                  onClick={entrar}
+                  disabled={entrando}
+                  className="w-full flex items-center justify-center gap-3 border border-slate-300 hover:bg-slate-50 rounded-xl py-3 text-sm font-bold text-slate-700 disabled:opacity-60 transition-all"
+                >
+                  <svg className="w-5 h-5" viewBox="0 0 48 48">
+                    <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+                    <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+                    <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+                    <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+                  </svg>
+                  <span>{entrando ? 'Abrindo login...' : 'Entrar com Google'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      return <App user={user} />;
+    }
+
     // Inicialização da renderização do React 18 no root do HTML
     const container = document.getElementById('root');
     const root = ReactDOM.createRoot(container);
-    root.render(<App />);
+    root.render(<AuthGate />);
   </script>
 </body>
 </html>
